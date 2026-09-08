@@ -44,7 +44,7 @@ fn open_or_create(file_path: &str) -> Result<Spreadsheet, AppError> {
 }
 
 /// 将数字列号转为 Excel 字母列名 (1 -> "A", 28 -> "AB")
-fn col_to_letter(mut col: u32) -> String {
+pub fn col_to_letter(mut col: u32) -> String {
     let mut s = String::new();
     while col > 0 {
         col -= 1;

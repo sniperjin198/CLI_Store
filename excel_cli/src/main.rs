@@ -14,12 +14,12 @@ fn main() {
 
     match args.command {
         // 阶段二：只读与检索
-        Commands::Inspect(arg) => match reader::inspect_file(&arg.file) {
-            Ok(data) => {
-                ApiResponse::success("inspect", data, "Inspect success").print_and_exit()
+        Commands::Inspect(arg) => {
+            match reader::inspect_file(&arg.file, arg.sheet.as_deref()) {
+                Ok(data) => ApiResponse::success("inspect", serde_json::to_value(data).unwrap(), "检查成功").print_and_exit(),
+                Err(e) => ApiResponse::fail("inspect", e.to_string()).print_and_exit(),
             }
-            Err(e) => ApiResponse::fail("inspect", e.to_string()).print_and_exit(),
-        },
+        }
 
         Commands::Search(arg) => {
             let limit = arg.limit.unwrap_or(0);
@@ -132,6 +132,17 @@ fn main() {
                 )
                 .print_and_exit(),
                 Err(e) => ApiResponse::fail("style", e.to_string()).print_and_exit(),
+            }
+        }
+
+		// 提取单元格或区域样式
+		Commands::StyleGet(arg) => {
+            match reader::get_style_info(&arg.file, arg.sheet.as_deref(), &arg.coord) {
+                Ok(data) => {
+                    ApiResponse::success("style-get", data, "Style retrieved successfully")
+                        .print_and_exit()
+                }
+                Err(e) => ApiResponse::fail("style-get", e.to_string()).print_and_exit(),
             }
         }
 

@@ -1,4 +1,3 @@
-/target
+/excel_cli/target/
 .goosehints
 excel_cli.exe
-test_out.xlsx

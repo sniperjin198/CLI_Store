@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use umya_spreadsheet::EnumTrait;
 
 use crate::error::AppError;
 
@@ -18,8 +19,18 @@ pub struct SheetMeta {
 #[derive(Serialize)]
 pub struct InspectData {
     pub file: String,
-    pub total_sheets: usize,
-    pub sheets: Vec<SheetMeta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_sheets: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheets: Option<Vec<SheetMeta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_sheet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cols: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -69,7 +80,7 @@ fn data_to_string(val: &Data) -> String {
 }
 
 /// 1. 检查与元数据提取
-pub fn inspect_file(file_path: &str) -> Result<InspectData, AppError> {
+pub fn inspect_file(file_path: &str, target_sheet: Option<&str>) -> Result<InspectData, AppError> {
     let path = Path::new(file_path);
     if !path.exists() {
         return Err(AppError::FileNotFound(file_path.to_string()));
@@ -78,31 +89,55 @@ pub fn inspect_file(file_path: &str) -> Result<InspectData, AppError> {
     let mut workbook = open_workbook_auto(path)
         .map_err(|e| AppError::Calamine(format!("无法打开文件，可能已被占用或格式损坏: {}", e)))?;
 
-    let sheet_names = workbook.sheet_names().to_vec();
-    let mut sheets = Vec::new();
+    if let Some(target) = target_sheet {
+        let range = workbook
+            .worksheet_range(target)
+            .map_err(|_| AppError::SheetNotFound(target.to_string()))?;
 
-    for name in &sheet_names {
-        if let Ok(range) = workbook.worksheet_range(name) {
-            let (rows, cols) = range.get_size();
-            sheets.push(SheetMeta {
-                name: name.clone(),
-                rows,
-                cols,
-            });
-        } else {
-            sheets.push(SheetMeta {
-                name: name.clone(),
-                rows: 0,
-                cols: 0,
-            });
+        let (rows, cols) = range.get_size();
+        let end_col = if cols > 0 { crate::writer::col_to_letter(cols as u32) } else { "A".to_string() };
+        let end_row = if rows > 0 { rows } else { 1 };
+
+        Ok(InspectData {
+            file: file_path.to_string(),
+            total_sheets: None,
+            sheets: None,
+            target_sheet: Some(target.to_string()),
+            rows: Some(rows),
+            cols: Some(cols),
+            range: Some(format!("A1:{}{}", end_col, end_row)),
+        })
+    } else {
+        let sheet_names = workbook.sheet_names().to_vec();
+        let mut sheets = Vec::new();
+
+        for name in &sheet_names {
+            if let Ok(range) = workbook.worksheet_range(name) {
+                let (rows, cols) = range.get_size();
+                sheets.push(SheetMeta {
+                    name: name.clone(),
+                    rows,
+                    cols,
+                });
+            } else {
+                sheets.push(SheetMeta {
+                    name: name.clone(),
+                    rows: 0,
+                    cols: 0,
+                });
+            }
         }
-    }
 
-    Ok(InspectData {
-        file: file_path.to_string(),
-        total_sheets: sheets.len(),
-        sheets,
-    })
+        Ok(InspectData {
+            file: file_path.to_string(),
+            total_sheets: Some(sheets.len()),
+            sheets: Some(sheets),
+            target_sheet: None,
+            rows: None,
+            cols: None,
+            range: None,
+        })
+    }
 }
 
 /// 2. 全文检索
@@ -287,5 +322,101 @@ pub fn export_to_csv(
         output_file: output_path.to_string(),
         exported_sheet: read_result.sheet,
         total_rows: read_result.total_rows,
+    })
+}
+
+// 5. 单元格样式提取
+use serde_json::{json, Value};
+
+/// 提取指定单元格或区域的样式属性
+pub fn get_style_info(
+    file_path: &str,
+    sheet_name: Option<&str>,
+    coord_str: &str,
+) -> Result<Value, AppError> {
+    let path = Path::new(file_path);
+    if !path.exists() {
+        return Err(AppError::FileNotFound(file_path.to_string()));
+    }
+
+    let book = umya_spreadsheet::reader::xlsx::read(path)
+        .map_err(|e| AppError::General(format!("读取文件样式失败: {}", e)))?;
+
+    let sheet = match sheet_name {
+        Some(name) => book
+            .get_sheet_by_name(name)
+            .ok_or_else(|| AppError::SheetNotFound(name.to_string()))?,
+        None => book
+            .get_sheet(&0)
+            .ok_or_else(|| AppError::General("工作簿内不存在任何工作表".to_string()))?,
+    };
+
+    if let Some((r1, c1, r2, c2)) = parse_range_str(coord_str) {
+        if r1 == r2 && c1 == c2 {
+            let col = (c1 + 1) as u32;
+            let row = (r1 + 1) as u32;
+            let style_json = extract_cell_style_json(sheet, col, row);
+
+            Ok(json!({
+                "coord": coord_str,
+                "sheet": sheet.get_name(),
+                "style": style_json
+            }))
+        } else {
+            let mut cells_map = serde_json::Map::new();
+
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    let col = (c + 1) as u32;
+                    let row = (r + 1) as u32;
+                    let cell_coord = umya_spreadsheet::helper::coordinate::coordinate_from_index(&col, &row);
+                    let style_json = extract_cell_style_json(sheet, col, row);
+                    cells_map.insert(cell_coord, style_json);
+                }
+            }
+
+            Ok(json!({
+                "range": coord_str,
+                "sheet": sheet.get_name(),
+                "cells": cells_map
+            }))
+        }
+    } else {
+        Err(AppError::InvalidCoordinate(format!(
+            "无效的坐标或范围格式: {}",
+            coord_str
+        )))
+    }
+}
+
+/// 提取单个单元格样式的核心私有函数
+fn extract_cell_style_json(sheet: &umya_spreadsheet::Worksheet, col: u32, row: u32) -> Value {
+    let cell = match sheet.get_cell((col, row)) {
+        Some(c) => c,
+        None => return json!({ "status": "empty_or_default" }),
+    };
+
+    let style = cell.get_style();
+    let font = style.get_font();
+    let align = style.get_alignment();
+    let fill = style.get_fill();
+    let borders = style.get_borders();
+
+    json!({
+        "font": {
+            "name": font.map(|f| f.get_name().to_string()).unwrap_or_default(),
+            "size": font.map(|f| *f.get_size()).unwrap_or(11.0),
+            "bold": font.map(|f| *f.get_bold()).unwrap_or(false),
+            "italic": font.map(|f| *f.get_italic()).unwrap_or(false),
+            "color": font.map(|f| f.get_color().get_argb().to_string()).unwrap_or_default()
+        },
+		"alignment": {
+            "horizontal": align.map(|a| a.get_horizontal().get_value_string().to_string()).unwrap_or_else(|| "general".to_string()),
+            "vertical": align.map(|a| a.get_vertical().get_value_string().to_string()).unwrap_or_else(|| "bottom".to_string())
+        },
+        "fill": {
+            "color": fill.and_then(|f| f.get_pattern_fill().and_then(|p| p.get_foreground_color().map(|c| c.get_argb().to_string()))).unwrap_or_default()
+        },
+        "border": borders.is_some()
     })
 }

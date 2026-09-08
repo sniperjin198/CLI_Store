@@ -28,11 +28,13 @@ pub enum Commands {
     Sheet(SheetArgs),
     /// 设置单元格或区域样式 (字体、字号、颜色、对齐、边框)
     Style(StyleArgs),
+    /// 获取指定单元格或区域的样式属性（不含数据内容）
+    StyleGet(StyleGetArgs),
     /// 调整行高与列宽
     Dimension(DimensionArgs),
     /// 合并单元格
     Merge(MergeArgs),
-	/// 插入或删除行/列 (insert-row / delete-row / insert-col / delete-col)
+    /// 插入或删除行/列 (insert-row / delete-row / insert-col / delete-col)
     Grid(GridArgs),
 }
 
@@ -40,6 +42,8 @@ pub enum Commands {
 pub struct InspectArgs {
     #[arg(short, long)]
     pub file: String,
+	#[arg(short, long)]
+    pub sheet: Option<String>,
 }
 
 #[derive(Args)]
@@ -130,8 +134,8 @@ pub struct StyleArgs {
     pub bold: Option<bool>,
     #[arg(long)]
     pub font_size: Option<f64>,
-	#[arg(long)]
-	pub font_name: Option<String>, 
+    #[arg(long)]
+    pub font_name: Option<String>, 
     #[arg(long)]
     pub font_color: Option<String>,
     #[arg(long)]
@@ -142,6 +146,16 @@ pub struct StyleArgs {
     pub align_v: Option<String>,
     #[arg(long)]
     pub border: Option<bool>,
+}
+
+#[derive(Args)]
+pub struct StyleGetArgs {
+    #[arg(short, long)]
+    pub file: String,
+    #[arg(short, long)]
+    pub coord: String,
+    #[arg(short, long)]
+    pub sheet: Option<String>,
 }
 
 #[derive(Args)]
@@ -175,9 +189,9 @@ pub struct GridArgs {
     #[arg(short, long)]
     pub file: String,
     #[arg(short, long)]
-    pub action: String, // insert-row, delete-row, insert-col, delete-col
+    pub action: String, 
     #[arg(short, long)]
-    pub target: String, // 行号 (如 3) 或 列标 (如 B 或 2)
+    pub target: String, 
     #[arg(short, long, default_value_t = 1)]
     pub count: u32,
     #[arg(short, long)]
