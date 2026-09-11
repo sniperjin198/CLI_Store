@@ -1,0 +1,20 @@
+{
+    "name": "word-cli",
+    "version": "0.1.0",
+    "description": "Windows 原生高性能 Word 命令行处理工具",
+    "main": "src/main.rs",
+    "scripts": {
+        "check": "cd /d E:\\GooseCliBuilder\\word_cli && cargo check",
+        "build": "cd /d E:\\GooseCliBuilder\\word_cli && cargo build --release",
+        "test": "cd /d E:\\GooseCliBuilder\\word_cli && cargo test"
+    },
+    "keywords": [
+        "word-cli",
+        "cli-tool",
+        "office",
+        "docx",
+        "rust"
+    ],
+    "author": "AAIF (Agentic AI Foundation)",
+    "license": "MIT"
+}

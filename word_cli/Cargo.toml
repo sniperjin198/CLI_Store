@@ -1,0 +1,36 @@
+[package]
+name = "word_cli"
+version = "0.1.0"
+edition = "2021"
+description = "Windows 原生高性能 Word 命令行处理工具，服务于本地大模型与自动化工作流的文档自省建构、大纲感知、精读讨论等场景"
+authors = ["AAIF <agentic.ai.foundation@example.com>"]
+license = "MIT"
+readme = "README.md"
+keywords = ["word-cli", "cli-tool", "office", "docx", "rust"]
+categories = ["command-line-utilities", "text-processing"]
+
+[dependencies]
+# CLI 参数解析 (derive 特性)
+clap = { version = "4.4", features = ["derive"] }
+
+# 序列化/反序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# XML/Office 文档解析
+quick-xml = "0.31"
+
+# ZIP 包操作 (用于 docx 处理)
+zip = "0.6"
+
+# Markdown 解析器
+pulldown-cmark = "0.9"
+
+# 遍历目录结构
+walkdir = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

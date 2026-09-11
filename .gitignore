@@ -1,0 +1,4 @@
+/excel_cli/target/
+/word_cli/target/
+.goosehints
+target/
