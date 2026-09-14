@@ -15,68 +15,128 @@ pub struct LayoutOpResponse {
     pub message: String,
 }
 
-/// 在指定段落前插入硬分页符
+/// 在指定段落前插入硬分页符（支持 0 代表首段前，"end"/None 代表文档末尾追加）
 pub fn insert_page_break_before(
     pkg: &mut DocxPackage,
     file_path: &str,
-    target_idx: usize,
+    index_opt: Option<&str>,
 ) -> Result<LayoutOpResponse, WordCliError> {
     let doc_xml = pkg.get_text("word/document.xml")?;
-    let mut reader = Reader::from_str(&doc_xml);
-    let mut writer = Writer::new(Cursor::new(Vec::new()));
-    let mut buf = Vec::new();
-
-    let mut current_idx = 0;
-    let mut inserted = false;
     let break_p_xml = r#"<w:p><w:r><w:br w:type="page"/></w:r></w:p>"#;
 
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"p" => {
-                if current_idx == target_idx && !inserted {
-                    writer
-                        .write_event(Event::Text(BytesText::from_escaped(break_p_xml)))
-                        .map_err(|e| WordCliError::xml_parse(e.to_string()))?;
-                    inserted = true;
-                }
-                writer
-                    .write_event(Event::Start(e.clone()))
-                    .map_err(|e| WordCliError::xml_parse(e.to_string()))?;
-            }
-            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
-                writer
-                    .write_event(Event::End(e.clone()))
-                    .map_err(|e| WordCliError::xml_parse(e.to_string()))?;
-                current_idx += 1;
-            }
-            Ok(Event::Eof) => break,
-            Ok(e) => {
-                writer
-                    .write_event(e)
-                    .map_err(|err| WordCliError::xml_parse(err.to_string()))?;
-            }
-            Err(e) => return Err(WordCliError::xml_parse(e.to_string())),
+    // 判断是否为末尾插入模式
+    let is_end_mode = match index_opt {
+        None => true,
+        Some(s) if s.trim().is_empty() || s.eq_ignore_ascii_case("end") || s == "-1" => true,
+        _ => false,
+    };
+
+    let updated = if is_end_mode {
+        // 末尾安全注入：插入到正文主体末尾、最终节属性 <w:sectPr 之前
+        if let Some(pos) = doc_xml.rfind("<w:sectPr") {
+            let (head, tail) = doc_xml.split_at(pos);
+            format!("{}{}{}", head, break_p_xml, tail)
+        } else if let Some(pos) = doc_xml.rfind("</w:body>") {
+            let (head, tail) = doc_xml.split_at(pos);
+            format!("{}{}{}", head, break_p_xml, tail)
+        } else {
+            return Err(WordCliError::corrupted_document("正文 XML 结构缺失 <w:body>"));
         }
-        buf.clear();
-    }
+    } else {
+        let target_idx = index_opt.unwrap().parse::<usize>().map_err(|_| {
+            WordCliError::invalid_parameter("index 必须为整数（如 0, 1）或 'end'/'-1'")
+        })?;
 
-    if !inserted {
-        return Err(WordCliError::invalid_parameter(format!(
-            "分页符插入索引越界: 目标索引 {} 超出最大段落数 {}",
-            target_idx, current_idx
-        )));
-    }
+        let mut reader = Reader::from_str(&doc_xml);
+        let mut writer = Writer::new(Cursor::new(Vec::new()));
+        let mut buf = Vec::new();
 
-    let result = writer.into_inner().into_inner();
-    let updated = String::from_utf8(result).map_err(|e| WordCliError::corrupted_document(e.to_string()))?;
+        let mut current_idx = 0;
+        let mut inserted = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) if e.local_name().as_ref() == b"p" => {
+                    if current_idx == target_idx && !inserted {
+                        writer
+                            .write_event(Event::Text(BytesText::from_escaped(break_p_xml)))
+                            .map_err(|e| WordCliError::xml_parse(e.to_string()))?;
+                        inserted = true;
+                    }
+                    writer
+                        .write_event(Event::Start(e.clone()))
+                        .map_err(|e| WordCliError::xml_parse(e.to_string()))?;
+                }
+                Ok(Event::End(ref e)) if e.local_name().as_ref() == b"p" => {
+                    writer
+                        .write_event(Event::End(e.clone()))
+                        .map_err(|e| WordCliError::xml_parse(e.to_string()))?;
+                    current_idx += 1;
+                }
+                Ok(Event::Eof) => break,
+                Ok(e) => {
+                    writer
+                        .write_event(e)
+                        .map_err(|err| WordCliError::xml_parse(err.to_string()))?;
+                }
+                Err(e) => return Err(WordCliError::xml_parse(e.to_string())),
+            }
+            buf.clear();
+        }
+
+        if !inserted {
+            return Err(WordCliError::invalid_parameter(format!(
+                "分页符插入索引越界: 目标索引 {} 超出最大段落数 {}",
+                target_idx, current_idx
+            )));
+        }
+
+        let result = writer.into_inner().into_inner();
+        String::from_utf8(result).map_err(|e| WordCliError::corrupted_document(e.to_string()))?
+    };
+
     pkg.set_text("word/document.xml", updated);
     pkg.save_to_file(file_path)?;
 
     Ok(LayoutOpResponse {
         status: "success".to_string(),
-        command: "break".to_string(),
+        command: "insert-page-break".to_string(),
         file: file_path.to_string(),
-        message: format!("已在段落 {} 前插入分页符", target_idx),
+        message: if is_end_mode {
+            "已在文档末尾插入分页符".to_string()
+        } else {
+            format!("已在段落 {} 前插入分页符", index_opt.unwrap_or("0"))
+        },
+    })
+}
+
+/// 在文档末尾插入新的分节符（真正的一分为二：下一页分节，支持独立版面）
+pub fn insert_section_break(
+    pkg: &mut DocxPackage,
+    file_path: &str,
+) -> Result<LayoutOpResponse, WordCliError> {
+    let doc_xml = pkg.get_text("word/document.xml")?;
+    // 下一页分节符的标准 OpenXML 表达结构
+    let section_break_xml = r#"<w:p><w:pPr><w:sectPr><w:type w:val="nextPage"/></w:sectPr></w:pPr></w:p>"#;
+
+    let updated = if let Some(pos) = doc_xml.rfind("<w:sectPr") {
+        let (head, tail) = doc_xml.split_at(pos);
+        format!("{}{}{}", head, section_break_xml, tail)
+    } else if let Some(pos) = doc_xml.rfind("</w:body>") {
+        let (head, tail) = doc_xml.split_at(pos);
+        format!("{}{}{}", head, section_break_xml, tail)
+    } else {
+        return Err(WordCliError::corrupted_document("正文 XML 结构缺失 <w:body>"));
+    };
+
+    pkg.set_text("word/document.xml", updated);
+    pkg.save_to_file(file_path)?;
+
+    Ok(LayoutOpResponse {
+        status: "success".to_string(),
+        command: "insert-section".to_string(),
+        file: file_path.to_string(),
+        message: "已在文档末尾成功插入下一页分节符（新节已就绪）".to_string(),
     })
 }
 
@@ -126,7 +186,6 @@ pub fn set_header_or_footer(
     }
 
     if page_num {
-        // 动态页码域: <w:fldSimple w:instr="PAGE"/>
         inner_p.push_str(r#"<w:fldSimple w:instr="PAGE"><w:r><w:t>1</w:t></w:r></w:fldSimple>"#);
     }
 
@@ -185,7 +244,6 @@ pub fn set_header_or_footer(
         }
     }
 
-    // 处理起始页码重新起算（例如正文第1页开始）
     if let Some(start_num) = restart_page {
         let pg_num_type = format!(r#"<w:pgNumType w:start="{}"/>"#, start_num);
         if let Some(pos) = doc_xml.rfind("<w:sectPr") {

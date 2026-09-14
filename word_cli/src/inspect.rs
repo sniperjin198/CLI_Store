@@ -13,6 +13,8 @@ pub struct SummaryInfo {
     pub total_images: usize,
     pub total_highlights: usize,
     pub total_sections: usize,
+    pub page_orientation: String,
+    pub page_size: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -41,6 +43,15 @@ pub struct ImageOverview {
 }
 
 #[derive(Debug, Serialize, Clone)]
+pub struct PageSectionOverview {
+    pub page_index: usize,
+    pub start_para_idx: usize,
+    pub end_para_idx: usize,
+    pub headings: Vec<String>,
+    pub preview: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
 pub struct HighlightItem {
     pub para_idx: usize,
     pub color: String,
@@ -60,6 +71,8 @@ pub struct InspectResponse {
     pub images: Option<Vec<ImageOverview>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub highlights: Option<Vec<HighlightItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Vec<PageSectionOverview>>,
 }
 
 pub fn inspect_document(
@@ -81,9 +94,12 @@ pub fn inspect_document(
     let mut tables = Vec::new();
     let mut images = Vec::new();
     let mut highlights = Vec::new();
+    let mut pages = Vec::new();
 
-    let mut current_para_idx = 0;
+    let mut current_para_idx: usize = 0;
     let mut total_sections = 0;
+    let mut page_orientation = "portrait".to_string();
+    let mut page_size = "A4".to_string();
 
     let mut in_para = false;
     let mut current_para_text = String::new();
@@ -99,6 +115,12 @@ pub fn inspect_document(
     let mut in_row = false;
     let mut in_cell = false;
     let mut current_cell_text = String::new();
+	
+	// 页面切片跟踪
+	let mut current_page_idx: usize = 1;
+	let mut page_start_para: usize = 0;
+	let mut page_headings = Vec::new();
+	let mut page_preview = String::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -129,9 +151,7 @@ pub fn inspect_document(
                         }
                     }
                 }
-                b"t" if in_run => {
-                    // 等待 Text 事件捕获文字
-                }
+                b"t" if in_run => {}
                 b"tbl" => {
                     in_table = true;
                     table_rows = 0;
@@ -146,7 +166,6 @@ pub fn inspect_document(
                     current_cell_text.clear();
                 }
                 b"extent" => {
-                    // EMU 转 mm: 1 mm = 36000 EMU
                     let mut cx = 0f64;
                     let mut cy = 0f64;
                     for attr in e.attributes().flatten() {
@@ -196,6 +215,25 @@ pub fn inspect_document(
                 _ => {}
             },
             Ok(Event::Empty(e)) => match e.local_name().as_ref() {
+                b"br" => {
+                    for attr in e.attributes().flatten() {
+                        if attr.key.local_name().as_ref() == b"type"
+                            && attr.value.as_ref() == b"page"
+                        {
+                            pages.push(PageSectionOverview {
+                                page_index: current_page_idx,
+                                start_para_idx: page_start_para,
+                                end_para_idx: current_para_idx.saturating_sub(1),
+                                headings: page_headings.clone(),
+                                preview: page_preview.chars().take(80).collect(),
+                            });
+                            current_page_idx += 1;
+                            page_start_para = current_para_idx;
+                            page_headings.clear();
+                            page_preview.clear();
+                        }
+                    }
+                }
                 b"pStyle" if in_para => {
                     for attr in e.attributes().flatten() {
                         if attr.key.local_name().as_ref() == b"val" {
@@ -211,6 +249,43 @@ pub fn inspect_document(
                                 Some(String::from_utf8_lossy(&attr.value).to_string());
                         }
                     }
+                }
+                b"pgSz" => {
+                    let mut w = 0u32;
+                    let mut h = 0u32;
+                    for attr in e.attributes().flatten() {
+                        match attr.key.local_name().as_ref() {
+                            b"orient" => {
+                                page_orientation =
+                                    String::from_utf8_lossy(&attr.value).to_string();
+                            }
+                            b"w" => {
+                                w = String::from_utf8_lossy(&attr.value)
+                                    .parse::<u32>()
+                                    .unwrap_or(0);
+                            }
+                            b"h" => {
+                                h = String::from_utf8_lossy(&attr.value)
+                                    .parse::<u32>()
+                                    .unwrap_or(0);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if page_orientation == "portrait" && w > h && w > 0 && h > 0 {
+                        page_orientation = "landscape".to_string();
+                    }
+                    let max_dim = w.max(h);
+                    let min_dim = w.min(h);
+                    page_size = if (max_dim as i32 - 16838).abs() < 100 && (min_dim as i32 - 11906).abs() < 100 {
+                        "A4".to_string()
+                    } else if (max_dim as i32 - 23811).abs() < 100 && (min_dim as i32 - 16838).abs() < 100 {
+                        "A3".to_string()
+                    } else if (max_dim as i32 - 15840).abs() < 100 && (min_dim as i32 - 12240).abs() < 100 {
+                        "Letter".to_string()
+                    } else {
+                        "Custom".to_string()
+                    };
                 }
                 b"extent" => {
                     let mut cx = 0f64;
@@ -288,15 +363,21 @@ pub fn inspect_document(
                 }
                 b"p" => {
                     in_para = false;
-                    if let Some(level) = detect_heading_level(&current_style_id) {
-                        let trimmed = current_para_text.trim().to_string();
-                        if !trimmed.is_empty() {
+                    let trimmed = current_para_text.trim().to_string();
+                    if !trimmed.is_empty() {
+                        if let Some(level) = detect_heading_level(&current_style_id) {
                             outline.push(OutlineItem {
                                 level,
-                                text: trimmed,
+                                text: trimmed.clone(),
                                 para_idx: current_para_idx,
                                 style_id: current_style_id.clone(),
                             });
+                            page_headings.push(trimmed.clone());
+                        } else if page_preview.len() < 120 {
+                            if !page_preview.is_empty() {
+                                page_preview.push(' ');
+                            }
+                            page_preview.push_str(&trimmed);
                         }
                     }
                     current_para_idx += 1;
@@ -335,12 +416,25 @@ pub fn inspect_document(
         buf.clear();
     }
 
+    // 闭合最后一页切片
+    if current_para_idx > page_start_para || pages.is_empty() {
+        pages.push(PageSectionOverview {
+            page_index: current_page_idx,
+            start_para_idx: page_start_para,
+            end_para_idx: current_para_idx.saturating_sub(1),
+            headings: page_headings,
+            preview: page_preview.chars().take(80).collect(),
+        });
+    }
+
     let summary = SummaryInfo {
         total_paragraphs: current_para_idx,
         total_tables: tables.len(),
         total_images: images.len(),
         total_highlights: highlights.len(),
         total_sections: if total_sections == 0 { 1 } else { total_sections },
+        page_orientation,
+        page_size,
     };
 
     match only {
@@ -351,6 +445,7 @@ pub fn inspect_document(
             tables: None,
             images: None,
             highlights: None,
+            pages: None,
         }),
         Some("outline") => Ok(InspectResponse {
             status: "success".to_string(),
@@ -359,6 +454,7 @@ pub fn inspect_document(
             tables: None,
             images: None,
             highlights: None,
+            pages: None,
         }),
         Some("tables") => Ok(InspectResponse {
             status: "success".to_string(),
@@ -367,6 +463,7 @@ pub fn inspect_document(
             tables: Some(tables),
             images: None,
             highlights: None,
+            pages: None,
         }),
         Some("images") => Ok(InspectResponse {
             status: "success".to_string(),
@@ -375,6 +472,7 @@ pub fn inspect_document(
             tables: None,
             images: Some(images),
             highlights: None,
+            pages: None,
         }),
         Some("highlights") => Ok(InspectResponse {
             status: "success".to_string(),
@@ -383,6 +481,16 @@ pub fn inspect_document(
             tables: None,
             images: None,
             highlights: Some(highlights),
+            pages: None,
+        }),
+        Some("pages") => Ok(InspectResponse {
+            status: "success".to_string(),
+            summary: None,
+            outline: None,
+            tables: None,
+            images: None,
+            highlights: None,
+            pages: Some(pages),
         }),
         _ => Ok(InspectResponse {
             status: "success".to_string(),
@@ -391,6 +499,7 @@ pub fn inspect_document(
             tables: Some(tables),
             images: Some(images),
             highlights: Some(highlights),
+            pages: Some(pages),
         }),
     }
 }
@@ -429,17 +538,17 @@ fn parse_relationships(pkg: &DocxPackage) -> HashMap<String, String> {
 
 fn detect_heading_level(style_id: &str) -> Option<u8> {
     let lower = style_id.to_lowercase();
-    if lower.contains("heading1") || lower.contains("heading 1") || lower.contains("1") && lower.contains("标题") {
+    if lower.contains("heading1") || lower.contains("heading 1") || (lower.contains('1') && lower.contains("标题")) {
         Some(1)
-    } else if lower.contains("heading2") || lower.contains("heading 2") || lower.contains("2") && lower.contains("标题") {
+    } else if lower.contains("heading2") || lower.contains("heading 2") || (lower.contains('2') && lower.contains("标题")) {
         Some(2)
-    } else if lower.contains("heading3") || lower.contains("heading 3") || lower.contains("3") && lower.contains("标题") {
+    } else if lower.contains("heading3") || lower.contains("heading 3") || (lower.contains('3') && lower.contains("标题")) {
         Some(3)
-    } else if lower.contains("heading4") || lower.contains("heading 4") || lower.contains("4") && lower.contains("标题") {
+    } else if lower.contains("heading4") || lower.contains("heading 4") || (lower.contains('4') && lower.contains("标题")) {
         Some(4)
-    } else if lower.contains("heading5") || lower.contains("heading 5") || lower.contains("5") && lower.contains("标题") {
+    } else if lower.contains("heading5") || lower.contains("heading 5") || (lower.contains('5') && lower.contains("标题")) {
         Some(5)
-    } else if lower.contains("heading6") || lower.contains("heading 6") || lower.contains("6") && lower.contains("标题") {
+    } else if lower.contains("heading6") || lower.contains("heading 6") || (lower.contains('6') && lower.contains("标题")) {
         Some(6)
     } else {
         None

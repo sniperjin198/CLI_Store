@@ -17,7 +17,7 @@ use std::process::ExitCode;
 
 use crate::content::{read_paragraphs, replace_text, set_highlight};
 use crate::error::WordCliError;
-use crate::header_footer::{insert_page_break_before, set_header_or_footer};
+use crate::header_footer::{insert_page_break_before, insert_section_break, set_header_or_footer};
 use crate::importer::import_markdown;
 use crate::inspect::inspect_document;
 use crate::lifecycle::{create_document, save_as};
@@ -34,7 +34,7 @@ use crate::table::{delete_table_row, insert_table_row, read_table_data, set_cell
 #[derive(Parser, Debug)]
 #[command(
     name = "word_cli",
-    version = "0.6.0",
+    version = "0.7.0",
     about = "高性能、CLI驱动的Word文档自动化处理工具",
     disable_help_subcommand = true
 )]
@@ -147,22 +147,29 @@ enum Commands {
         index: usize,
     },
 
-    /// 段落格式刷平与排版调整
+    /// 段落格式刷平与排版调整（支持单段或批量范围）
     ParaFormat {
         #[arg(long)]
         file: String,
+        /// 单个段落序号（与 --range 二选一）
         #[arg(long)]
-        index: usize,
+        index: Option<usize>,
+        /// 批量段落范围，例如 "0:25" 或 "all"
+        #[arg(long)]
+        range: Option<String>,
+        /// 目标过滤范围: body（默认，仅处理正文避免误伤标题）或 all（所有段落）
+        #[arg(long, default_value = "body")]
+        target: String,
         /// 首行缩进字符数，例如 2.0
         #[arg(long)]
         indent: Option<f64>,
         /// 行距倍数，例如 1.5
         #[arg(long)]
         spacing: Option<f64>,
-        /// 字体名称，例如 "黑体"、"仿宋"
+        /// 字体名称，例如 "宋体"、"黑体"、"仿宋"
         #[arg(long)]
         font: Option<String>,
-        /// 字号磅值 (pt)，例如小二是 18.0，三号是 16.0，四号是 14.0
+        /// 字号磅值 (pt)，例如小二是 18.0，三号是 16.0，四号是 14.0，小四是 12.0
         #[arg(long)]
         size: Option<f64>,
         /// 是否加粗
@@ -284,12 +291,18 @@ enum Commands {
         size: String,
     },
 
-    /// 在指定段落前插入分页符
+    /// 在指定段落前插入分页符（留空或传 end 默认为末尾插入）
     InsertPageBreak {
         #[arg(long)]
         file: String,
+        #[arg(long, allow_hyphen_values = true)]
+        index: Option<String>,
+    },
+
+    /// 在文档末尾插入独立下一页分节符
+    InsertSection {
         #[arg(long)]
-        index: usize,
+        file: String,
     },
 
     /// 设置文档页眉
@@ -415,6 +428,8 @@ fn run() -> Result<(), WordCliError> {
         Commands::ParaFormat {
             file,
             index,
+            range,
+            target,
             indent,
             spacing,
             font,
@@ -427,6 +442,8 @@ fn run() -> Result<(), WordCliError> {
                 &mut pkg,
                 &file,
                 index,
+                range.as_deref(),
+                &target,
                 indent,
                 spacing,
                 font.as_deref(),
@@ -517,7 +534,12 @@ fn run() -> Result<(), WordCliError> {
         }
         Commands::InsertPageBreak { file, index } => {
             let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = insert_page_break_before(&mut pkg, &file, index)?;
+            let resp = insert_page_break_before(&mut pkg, &file, index.as_deref())?;
+            print_json(&resp);
+        }
+        Commands::InsertSection { file } => {
+            let mut pkg = DocxPackage::from_file(&file)?;
+            let resp = insert_section_break(&mut pkg, &file)?;
             print_json(&resp);
         }
         Commands::SetHeader { file, text, unlink } => {

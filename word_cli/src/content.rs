@@ -106,13 +106,13 @@ pub fn replace_text(
     let mut replace_map = HashMap::new();
 
     if let (Some(f), Some(t)) = (from_pattern, to_text) {
-        replace_map.insert(f.to_string(), escape_xml(t));
+        replace_map.insert(escape_xml(f), escape_xml(t));
     }
 
     if let Some(pairs) = pairs_str {
         for pair in pairs.split(',') {
             if let Some((k, v)) = pair.split_once('=') {
-                replace_map.insert(k.trim().to_string(), escape_xml(v.trim()));
+                replace_map.insert(escape_xml(k.trim()), escape_xml(v.trim()));
             }
         }
     }
@@ -146,7 +146,7 @@ pub fn replace_text(
     })
 }
 
-/// 突出高亮控制：支持对关键词标黄/标绿（yellow|green|cyan 等），传入 none 清除高亮
+/// 突出高亮控制：合规拆分 <w:t> 并应用高亮样式，杜绝在 <w:t> 内部嵌套 <w:r> 导致的 XML 语法损毁
 pub fn set_highlight(
     pkg: &mut DocxPackage,
     file_path: &str,
@@ -157,27 +157,32 @@ pub fn set_highlight(
         return Err(WordCliError::invalid_parameter("必须提供待检索高亮的 --text 关键词"));
     }
 
-    let mut doc_xml = pkg.get_text("word/document.xml")?;
+    let doc_xml = pkg.get_text("word/document.xml")?;
     let target_color = color.to_lowercase();
+    let escaped_kw = escape_xml(keyword);
 
-    // 构造高亮 Run
+    // 核心修复：
+    // 在遇到关键词时，先闭合旧的 </w:t></w:r>，开辟独立的高亮 <w:r>，再开启后续正常的 <w:r><w:t> 接收剩余文字
     let replacement = if target_color == "none" {
         format!(
-            r#"<w:r><w:rPr><w:highlight w:val="none"/></w:rPr><w:t xml:space="preserve">{}</w:t></w:r>"#,
-            escape_xml(keyword)
+            r#"</w:t></w:r><w:r><w:rPr><w:highlight w:val="none"/></w:rPr><w:t xml:space="preserve">{}</w:t></w:r><w:r><w:t xml:space="preserve">"#,
+            escaped_kw
         )
     } else {
         format!(
-            r#"<w:r><w:rPr><w:highlight w:val="{}"/></w:rPr><w:t xml:space="preserve">{}</w:t></w:r>"#,
-            target_color,
-            escape_xml(keyword)
+            r#"</w:t></w:r><w:r><w:rPr><w:highlight w:val="{}"/></w:rPr><w:t xml:space="preserve">{}</w:t></w:r><w:r><w:t xml:space="preserve">"#,
+            target_color, escaped_kw
         )
     };
 
-    let count = doc_xml.matches(keyword).count();
+    let count = doc_xml.matches(&escaped_kw).count();
     if count > 0 {
-        doc_xml = doc_xml.replace(keyword, &replacement);
-        pkg.set_text("word/document.xml", doc_xml);
+        let updated_xml = doc_xml.replace(&escaped_kw, &replacement);
+        // 清除因刚好位于开头或结尾而切分出的多余空文本节点
+        let cleaned_xml = updated_xml
+            .replace(r#"<w:r><w:t xml:space="preserve"></w:t></w:r>"#, "")
+            .replace(r#"<w:t xml:space="preserve"></w:t>"#, "");
+        pkg.set_text("word/document.xml", cleaned_xml);
         pkg.save_to_file(file_path)?;
     }
 
