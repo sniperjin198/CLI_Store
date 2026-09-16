@@ -327,3 +327,48 @@ fn append_content_stream(doc: &mut Document, page_id: ObjectId, stream_id: Objec
         }
     }
 }
+
+/// 批量水印印章注入：支持单文件或通过 --dir 传入的多文件列表
+pub fn watermark_batch(
+    target_paths: &[std::path::PathBuf],
+    text: &str,
+    opacity: f64,
+    font_size: f64,
+    rotation: f64,
+    output_file: Option<&str>,
+) -> Result<WatermarkResponse, PdfCliError> {
+    if target_paths.is_empty() {
+        return Err(PdfCliError::invalid_parameter("未定位到需要添加水印的 PDF 文件"));
+    }
+
+    let is_batch = target_paths.len() > 1;
+    let mut total_watermarked_pages = 0;
+
+    for file_path in target_paths {
+        let path_str = file_path.to_string_lossy().to_string();
+        let target_out = if !is_batch && output_file.is_some() {
+            output_file
+        } else {
+            Some(path_str.as_str())
+        };
+
+        let resp = add_watermark(&path_str, text, opacity, font_size, rotation, target_out)?;
+        total_watermarked_pages += resp.watermarked_pages;
+    }
+
+    let display_output = if is_batch {
+        format!("批量水印处理完成 (共 {} 个文件)", target_paths.len())
+    } else if let Some(out) = output_file {
+        out.replace('\\', "/")
+    } else {
+        target_paths[0].to_string_lossy().replace('\\', "/")
+    };
+
+    Ok(WatermarkResponse {
+        status: "success".to_string(),
+        action: "watermark".to_string(),
+        output_file: display_output,
+        watermarked_pages: total_watermarked_pages,
+        text: text.to_string(),
+    })
+}

@@ -4,6 +4,7 @@ use quick_xml::Writer;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::Cursor;
+use std::path::PathBuf;
 
 use crate::error::WordCliError;
 use crate::package::{escape_xml, DocxPackage};
@@ -24,7 +25,8 @@ pub struct MergeResponse {
     pub status: String,
     pub command: String,
     pub base_file: String,
-    pub appended_file: String,
+    pub merged_files_count: usize,
+    pub total_paragraphs_added: usize,
     pub message: String,
 }
 
@@ -228,50 +230,71 @@ pub fn apply_style_to_paragraph(
     })
 }
 
-/// 外部文档追加合并
-pub fn merge_documents(
+/// 批量文档追加合并：原生支持多个副文档一次性按序全量缝合到主文档末尾
+pub fn merge_multiple_documents(
     base_pkg: &mut DocxPackage,
     base_path: &str,
-    append_path: &str,
+    append_paths: &[PathBuf],
 ) -> Result<MergeResponse, WordCliError> {
-    let append_pkg = DocxPackage::from_file(append_path)?;
-    let append_xml = append_pkg.get_text("word/document.xml")?;
+    if append_paths.is_empty() {
+        return Err(WordCliError::invalid_parameter("必须提供至少一个待合并追加的副文档"));
+    }
 
-    let body_start = append_xml.find("<w:body>").ok_or_else(|| {
-        WordCliError::corrupted_document("待合并文档缺少 <w:body> 节点")
-    })? + 8;
+    let mut base_xml = base_pkg.get_text("word/document.xml")?;
+    let mut total_added_paras = 0;
+    let mut processed_count = 0;
 
-    let body_end = if let Some(sect) = append_xml.rfind("<w:sectPr") {
-        sect
-    } else if let Some(bend) = append_xml.rfind("</w:body>") {
-        bend
-    } else {
-        append_xml.len()
-    };
+    for path in append_paths {
+        // 跳过 base 文档自身，防止死循环与自我覆盖包含
+        if let (Ok(can_base), Ok(can_app)) = (std::fs::canonicalize(base_path), path.canonicalize()) {
+            if can_base == can_app {
+                continue;
+            }
+        }
 
-    let append_content = &append_xml[body_start..body_end];
+        let app_pkg = DocxPackage::from_file(path)?;
+        let app_xml = app_pkg.get_text("word/document.xml")?;
 
-    let base_xml = base_pkg.get_text("word/document.xml")?;
-    let insert_pos = if let Some(sect) = base_xml.rfind("<w:sectPr") {
-        sect
-    } else if let Some(bend) = base_xml.rfind("</w:body>") {
-        bend
-    } else {
-        return Err(WordCliError::corrupted_document("主文档结构异常"));
-    };
+        let body_start = match app_xml.find("<w:body>") {
+            Some(pos) => pos + 8,
+            None => continue,
+        };
 
-    let (head, tail) = base_xml.split_at(insert_pos);
-    let merged_xml = format!("{}{}{}", head, append_content, tail);
+        let body_end = if let Some(sect) = app_xml.rfind("<w:sectPr") {
+            sect
+        } else if let Some(bend) = app_xml.rfind("</w:body>") {
+            bend
+        } else {
+            app_xml.len()
+        };
 
-    base_pkg.set_text("word/document.xml", merged_xml);
+        let append_content = &app_xml[body_start..body_end];
+        total_added_paras += append_content.matches("<w:p>").count() + append_content.matches("<w:p ").count();
+
+        // 始终插入在主文档最后一个节属性 <w:sectPr 前
+        let insert_pos = if let Some(sect) = base_xml.rfind("<w:sectPr") {
+            sect
+        } else if let Some(bend) = base_xml.rfind("</w:body>") {
+            bend
+        } else {
+            return Err(WordCliError::corrupted_document("主文档结构异常"));
+        };
+
+        let (head, tail) = base_xml.split_at(insert_pos);
+        base_xml = format!("{}{}{}", head, append_content, tail);
+        processed_count += 1;
+    }
+
+    base_pkg.set_text("word/document.xml", base_xml);
     base_pkg.save_to_file(base_path)?;
 
     Ok(MergeResponse {
         status: "success".to_string(),
         command: "merge".to_string(),
-        base_file: base_path.to_string(),
-        appended_file: append_path.to_string(),
-        message: "文档合并完成".to_string(),
+        base_file: base_path.replace('\\', "/"),
+        merged_files_count: processed_count,
+        total_paragraphs_added: total_added_paras,
+        message: format!("已成功将 {} 个文档的内容追加合并至主文档", processed_count),
     })
 }
 

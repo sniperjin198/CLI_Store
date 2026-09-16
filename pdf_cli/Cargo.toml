@@ -23,4 +23,5 @@ windows = { version = "0.52", features = [
     "Graphics_Imaging",
     "System",
     "Win32_System_WinRT",
+    "Win32_System_Console",
 ] }

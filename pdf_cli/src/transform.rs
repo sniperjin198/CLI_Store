@@ -1,21 +1,34 @@
 use lopdf::{Dictionary, Document, Object};
 use serde::Serialize;
+use std::path::{Path, PathBuf};
 
 use crate::error::PdfCliError;
+use crate::io_channel::ensure_output_dir;
 
 #[derive(Debug, Serialize)]
 pub struct TransformResponse {
     pub status: String,
     pub action: String,
     pub output_file: String,
+    pub input_files_count: usize,
     pub affected_pages: usize,
     pub message: String,
 }
 
-pub fn merge_pdfs(input_files: &[String], output_file: &str) -> Result<TransformResponse, PdfCliError> {
-    if input_files.len() < 2 {
-        return Err(PdfCliError::invalid_parameter("合并操作至少需要提供 2 个 PDF 文件"));
+/// 物理合并：接收通用 io_channel 解析好的有效 PathBuf 列表
+pub fn merge_resolved_pdfs(
+    target_paths: &[PathBuf],
+    output_file: &str,
+) -> Result<TransformResponse, PdfCliError> {
+    if target_paths.len() < 2 {
+        return Err(PdfCliError::invalid_parameter(format!(
+            "合并操作至少需要提供 2 个有效 PDF 文档，当前仅定位到 {} 个输入文件",
+            target_paths.len()
+        )));
     }
+
+    let out_path = Path::new(output_file);
+    ensure_output_dir(out_path)?;
 
     let mut target_doc = Document::with_version("1.5");
     let mut total_merged_pages = 0;
@@ -25,9 +38,10 @@ pub fn merge_pdfs(input_files: &[String], output_file: &str) -> Result<Transform
     let target_pages_id = pages_id;
     let mut page_tree_kids: Vec<Object> = Vec::new();
 
-    for file_path in input_files {
+    for file_path in target_paths {
+        let path_str = file_path.to_string_lossy().to_string();
         let mut source_doc = Document::load(file_path).map_err(|e| {
-            PdfCliError::corrupted_document(format!("无法加载输入文件 '{}': {}", file_path, e))
+            PdfCliError::corrupted_document(format!("无法加载输入文件 '{}': {}", path_str, e))
         })?;
 
         source_doc.renumber_objects_with(target_doc.max_id + 1);
@@ -64,7 +78,7 @@ pub fn merge_pdfs(input_files: &[String], output_file: &str) -> Result<Transform
     target_doc.trailer.set("Root", catalog_id);
 
     target_doc.prune_objects();
-    target_doc.save(output_file).map_err(|e| {
+    target_doc.save(out_path).map_err(|e| {
         PdfCliError::io(format!("保存合并 PDF 失败 '{}': {}", output_file, e))
     })?;
 
@@ -72,16 +86,21 @@ pub fn merge_pdfs(input_files: &[String], output_file: &str) -> Result<Transform
         status: "success".to_string(),
         action: "merge".to_string(),
         output_file: output_file.replace('\\', "/"),
+        input_files_count: target_paths.len(),
         affected_pages: total_merged_pages,
-        message: format!("已成功将 {} 个文档合并为 {} 页", input_files.len(), total_merged_pages),
+        message: format!("已成功将 {} 个文档合并为 {} 页交付件", target_paths.len(), total_merged_pages),
     })
 }
 
+/// 页面抽取：从源文档抽取指定页并存为新 PDF
 pub fn extract_pages(
     file_path: &str,
     range_expr: &str,
     output_file: &str,
 ) -> Result<TransformResponse, PdfCliError> {
+    let out_path = Path::new(output_file);
+    ensure_output_dir(out_path)?;
+
     let mut doc = Document::load(file_path).map_err(|e| {
         PdfCliError::corrupted_document(format!("无法加载 PDF 文档 '{}': {}", file_path, e))
     })?;
@@ -106,7 +125,7 @@ pub fn extract_pages(
     doc.delete_pages(&to_remove);
     doc.prune_objects();
 
-    doc.save(output_file).map_err(|e| {
+    doc.save(out_path).map_err(|e| {
         PdfCliError::io(format!("保存抽取页面文件 '{}': {}", output_file, e))
     })?;
 
@@ -114,14 +133,15 @@ pub fn extract_pages(
         status: "success".to_string(),
         action: "extract-pages".to_string(),
         output_file: output_file.replace('\\', "/"),
+        input_files_count: 1,
         affected_pages: target_page_nums.len(),
-        message: format!("已提取第 {:?} 页到新文件", target_page_nums),
+        message: format!("已成功提取第 {:?} 页到新文件", target_page_nums),
     })
 }
 
-pub fn rotate_pages(
-    file_path: &str,
-    page: Option<usize>,
+/// 批量页面旋转：支持单文件或多文件（--dir）批量校正
+pub fn rotate_pages_batch(
+    target_paths: &[PathBuf],
     range: Option<&str>,
     degrees: i32,
     output_file: Option<&str>,
@@ -130,55 +150,80 @@ pub fn rotate_pages(
         return Err(PdfCliError::invalid_parameter("旋转角度必须为 90 的整数倍（例如 90, 180, 270）"));
     }
 
-    let mut doc = Document::load(file_path).map_err(|e| {
-        PdfCliError::corrupted_document(format!("无法加载 PDF 文档 '{}': {}", file_path, e))
-    })?;
-
-    let all_pages = doc.get_pages();
-    let total_pages = all_pages.len();
-
-    let target_page_nums = if let Some(p) = page {
-        if p == 0 || p > total_pages {
-            return Err(PdfCliError::invalid_parameter(format!("页码 {} 越界", p)));
-        }
-        vec![p]
-    } else if let Some(r) = range {
-        parse_range(r, total_pages)?
-    } else {
-        (1..=total_pages).collect()
-    };
-
-    let mut rotated_count = 0;
-    for page_num in &target_page_nums {
-        if let Some(&page_id) = all_pages.get(&(*page_num as u32)) {
-            if let Ok(page_dict) = doc.get_dictionary_mut(page_id) {
-                let current_rot = page_dict
-                    .get(b"Rotate")
-                    .and_then(Object::as_i64)
-                    .unwrap_or(0) as i32;
-
-                let mut next_rot = (current_rot + degrees) % 360;
-                if next_rot < 0 {
-                    next_rot += 360;
-                }
-
-                page_dict.set("Rotate", next_rot);
-                rotated_count += 1;
-            }
-        }
+    if target_paths.is_empty() {
+        return Err(PdfCliError::invalid_parameter("未提供任何需要旋转的 PDF 文件"));
     }
 
-    let save_target = output_file.unwrap_or(file_path);
-    doc.save(save_target).map_err(|e| {
-        PdfCliError::io(format!("保存旋转后的文件失败 '{}': {}", save_target, e))
-    })?;
+    let mut total_affected_pages = 0;
+    let is_batch = target_paths.len() > 1;
+
+    for file_path in target_paths {
+        let path_str = file_path.to_string_lossy().to_string();
+        let mut doc = Document::load(file_path).map_err(|e| {
+            PdfCliError::corrupted_document(format!("无法加载 PDF 文档 '{}': {}", path_str, e))
+        })?;
+
+        let all_pages = doc.get_pages();
+        let total_pages = all_pages.len();
+
+        let target_page_nums = if let Some(r) = range {
+            parse_range(r, total_pages)?
+        } else {
+            (1..=total_pages).collect()
+        };
+
+        let mut current_file_rotated = 0;
+        for page_num in &target_page_nums {
+            if let Some(&page_id) = all_pages.get(&(*page_num as u32)) {
+                if let Ok(page_dict) = doc.get_dictionary_mut(page_id) {
+                    let current_rot = page_dict
+                        .get(b"Rotate")
+                        .and_then(Object::as_i64)
+                        .unwrap_or(0) as i32;
+
+                    let mut next_rot = (current_rot + degrees) % 360;
+                    if next_rot < 0 {
+                        next_rot += 360;
+                    }
+
+                    page_dict.set("Rotate", next_rot);
+                    current_file_rotated += 1;
+                }
+            }
+        }
+
+        // 多文件批处理时默认覆盖各自源文件；单文件时支持 output 指定另存路径
+        let save_target = if !is_batch && output_file.is_some() {
+            output_file.unwrap().to_string()
+        } else {
+            path_str
+        };
+
+        let save_path = Path::new(&save_target);
+        ensure_output_dir(save_path)?;
+
+        doc.save(save_path).map_err(|e| {
+            PdfCliError::io(format!("保存旋转文件失败 '{}': {}", save_target, e))
+        })?;
+
+        total_affected_pages += current_file_rotated;
+    }
+
+    let display_output = if is_batch {
+        format!("批量就地修改 {} 个文件", target_paths.len())
+    } else if let Some(out) = output_file {
+        out.replace('\\', "/")
+    } else {
+        target_paths[0].to_string_lossy().replace('\\', "/")
+    };
 
     Ok(TransformResponse {
         status: "success".to_string(),
         action: "rotate".to_string(),
-        output_file: save_target.replace('\\', "/"),
-        affected_pages: rotated_count,
-        message: format!("已成功将 {} 个页面旋转 {} 度", rotated_count, degrees),
+        output_file: display_output,
+        input_files_count: target_paths.len(),
+        affected_pages: total_affected_pages,
+        message: format!("已成功完成 {} 个文档共 {} 页的 {} 度旋转校正", target_paths.len(), total_affected_pages, degrees),
     })
 }
 

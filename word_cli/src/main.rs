@@ -8,6 +8,7 @@ mod media;
 mod package;
 mod page;
 mod paragraph;
+mod path_utils;
 mod styles;
 mod table;
 
@@ -26,16 +27,33 @@ use crate::package::DocxPackage;
 use crate::page::setup_page_layout;
 use crate::paragraph::{
     append_paragraph, apply_style_to_paragraph, delete_paragraph, format_paragraph,
-    insert_paragraph, merge_documents,
+    insert_paragraph, merge_multiple_documents,
 };
+use crate::path_utils::{clean_path, ensure_output_parent_dir, sanitize_existing_path};
 use crate::styles::list_styles;
 use crate::table::{delete_table_row, insert_table_row, read_table_data, set_cell_value};
+
+#[cfg(windows)]
+fn init_windows_utf8_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCP(wCodePageID: u32) -> i32;
+        fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+    }
+    unsafe {
+        SetConsoleCP(65001);
+        SetConsoleOutputCP(65001);
+    }
+}
+
+#[cfg(not(windows))]
+fn init_windows_utf8_console() {}
 
 #[derive(Parser, Debug)]
 #[command(
     name = "word_cli",
-    version = "0.7.0",
-    about = "高性能、CLI驱动的Word文档自动化处理工具",
+    version = "0.8.0",
+    about = "高性能、Agent-First 的 Word 文档自动化处理工具",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -151,31 +169,22 @@ enum Commands {
     ParaFormat {
         #[arg(long)]
         file: String,
-        /// 单个段落序号（与 --range 二选一）
         #[arg(long)]
         index: Option<usize>,
-        /// 批量段落范围，例如 "0:25" 或 "all"
         #[arg(long)]
         range: Option<String>,
-        /// 目标过滤范围: body（默认，仅处理正文避免误伤标题）或 all（所有段落）
         #[arg(long, default_value = "body")]
         target: String,
-        /// 首行缩进字符数，例如 2.0
         #[arg(long)]
         indent: Option<f64>,
-        /// 行距倍数，例如 1.5
         #[arg(long)]
         spacing: Option<f64>,
-        /// 字体名称，例如 "宋体"、"黑体"、"仿宋"
         #[arg(long)]
         font: Option<String>,
-        /// 字号磅值 (pt)，例如小二是 18.0，三号是 16.0，四号是 14.0，小四是 12.0
         #[arg(long)]
         size: Option<f64>,
-        /// 是否加粗
         #[arg(long)]
         bold: Option<bool>,
-        /// 刷平野杂色高亮与字体格式
         #[arg(long, default_value_t = false)]
         strip_formatting: bool,
     },
@@ -190,12 +199,16 @@ enum Commands {
         style: String,
     },
 
-    /// 合并外部 docx 内容
+    /// 追加合并文档（支持单个文件 --append，或整目录扫描 --dir，或逗号分隔 --files）
     Merge {
         #[arg(long)]
         file: String,
         #[arg(long)]
-        append: String,
+        append: Option<String>,
+        #[arg(long)]
+        dir: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        files: Option<Vec<String>>,
     },
 
     /// 读取表格二维数据（支持 json, markdown, csv）
@@ -204,7 +217,6 @@ enum Commands {
         file: String,
         #[arg(long, default_value_t = 0)]
         index: usize,
-        /// 输出格式: json, markdown (或 md), csv
         #[arg(long, default_value = "json")]
         format: String,
     },
@@ -283,15 +295,13 @@ enum Commands {
     Page {
         #[arg(long)]
         file: String,
-        /// 页面方向: portrait 或 landscape
         #[arg(long, default_value = "portrait")]
         orient: String,
-        /// 纸张规格: A4, A3
         #[arg(long, default_value = "A4")]
         size: String,
     },
 
-    /// 在指定段落前插入分页符（留空或传 end 默认为末尾插入）
+    /// 在指定段落前插入分页符
     InsertPageBreak {
         #[arg(long)]
         file: String,
@@ -311,7 +321,6 @@ enum Commands {
         file: String,
         #[arg(long)]
         text: Option<String>,
-        /// 解除继承绑定
         #[arg(long, default_value_t = false)]
         unlink: bool,
     },
@@ -322,13 +331,10 @@ enum Commands {
         file: String,
         #[arg(long)]
         text: Option<String>,
-        /// 开启动态页码域
         #[arg(long, default_value_t = false)]
         page_num: bool,
-        /// 起始页码重新编号（例如 1）
         #[arg(long)]
         restart: Option<u32>,
-        /// 解除继承绑定
         #[arg(long, default_value_t = false)]
         unlink: bool,
     },
@@ -344,55 +350,51 @@ fn print_json<T: Serialize>(value: &T) {
     }
 }
 
-fn run() -> Result<(), WordCliError> {
-    let cli = Cli::parse();
-
+fn run_app(cli: Cli) -> Result<(), WordCliError> {
     match cli.command {
         Commands::Create { file, template } => {
-            let resp = create_document(&file, template.as_deref())?;
+            let target = ensure_output_parent_dir(&file)?;
+            let tpl = template.as_deref().map(clean_path);
+            let resp = create_document(&target.to_string_lossy(), tpl.as_deref())?;
             print_json(&resp);
         }
         Commands::SaveAs { file, output } => {
-            let resp = save_as(&file, &output)?;
+            let src = sanitize_existing_path(&file)?;
+            let out = ensure_output_parent_dir(&output)?;
+            let resp = save_as(&src.to_string_lossy(), &out.to_string_lossy())?;
             print_json(&resp);
         }
         Commands::Inspect { file, only } => {
-            let pkg = DocxPackage::from_file(&file)?;
+            let p = sanitize_existing_path(&file)?;
+            let pkg = DocxPackage::from_file(&p)?;
             let resp = inspect_document(&pkg, only.as_deref())?;
             print_json(&resp);
         }
         Commands::Styles { file } => {
-            let pkg = DocxPackage::from_file(&file)?;
+            let p = sanitize_existing_path(&file)?;
+            let pkg = DocxPackage::from_file(&p)?;
             let resp = list_styles(&pkg)?;
             print_json(&resp);
         }
-        Commands::Import {
-            input,
-            output,
-            template,
-        } => {
-            let resp = import_markdown(&input, &output, template.as_deref())?;
+        Commands::Import { input, output, template } => {
+            let in_p = sanitize_existing_path(&input)?;
+            let out_p = ensure_output_parent_dir(&output)?;
+            let tpl = template.as_deref().map(clean_path);
+            let resp = import_markdown(&in_p.to_string_lossy(), &out_p.to_string_lossy(), tpl.as_deref())?;
             print_json(&resp);
         }
-        Commands::Read {
-            file,
-            range,
-            heading,
-        } => {
-            let pkg = DocxPackage::from_file(&file)?;
+        Commands::Read { file, range, heading } => {
+            let p = sanitize_existing_path(&file)?;
+            let pkg = DocxPackage::from_file(&p)?;
             let resp = read_paragraphs(&pkg, range.as_deref(), heading.as_deref())?;
             print_json(&resp);
         }
-        Commands::Replace {
-            file,
-            from,
-            to,
-            pairs,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
+        Commands::Replace { file, from, to, pairs } => {
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
             let resp = replace_text(
                 &mut pkg,
-                &file,
+                &p.to_string_lossy(),
                 from.as_deref(),
                 to.as_deref(),
                 pairs.as_deref(),
@@ -400,29 +402,27 @@ fn run() -> Result<(), WordCliError> {
             print_json(&resp);
         }
         Commands::Highlight { file, text, color } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = set_highlight(&mut pkg, &file, &text, &color)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = set_highlight(&mut pkg, &p.to_string_lossy(), &text, &color)?;
             print_json(&resp);
         }
-        Commands::InsertPara {
-            file,
-            index,
-            text,
-            style,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp =
-                insert_paragraph(&mut pkg, &file, index, &text, style.as_deref())?;
+        Commands::InsertPara { file, index, text, style } => {
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = insert_paragraph(&mut pkg, &p.to_string_lossy(), index, &text, style.as_deref())?;
             print_json(&resp);
         }
         Commands::AppendPara { file, text, style } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = append_paragraph(&mut pkg, &file, &text, style.as_deref())?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = append_paragraph(&mut pkg, &p.to_string_lossy(), &text, style.as_deref())?;
             print_json(&resp);
         }
         Commands::DeletePara { file, index } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = delete_paragraph(&mut pkg, &file, index)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = delete_paragraph(&mut pkg, &p.to_string_lossy(), index)?;
             print_json(&resp);
         }
         Commands::ParaFormat {
@@ -437,10 +437,11 @@ fn run() -> Result<(), WordCliError> {
             bold,
             strip_formatting,
         } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
             let resp = format_paragraph(
                 &mut pkg,
-                &file,
+                &p.to_string_lossy(),
                 index,
                 range.as_deref(),
                 &target,
@@ -454,108 +455,119 @@ fn run() -> Result<(), WordCliError> {
             print_json(&resp);
         }
         Commands::ApplyStyle { file, index, style } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = apply_style_to_paragraph(&mut pkg, &file, index, &style)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = apply_style_to_paragraph(&mut pkg, &p.to_string_lossy(), index, &style)?;
             print_json(&resp);
         }
-        Commands::Merge { file, append } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = merge_documents(&mut pkg, &file, &append)?;
+        Commands::Merge { file, append, dir, files } => {
+            let base_p = sanitize_existing_path(&file)?;
+            let mut append_list = Vec::new();
+
+            if let Some(d) = dir {
+                let dir_p = sanitize_existing_path(&d)?;
+                if dir_p.is_dir() {
+                    for entry in std::fs::read_dir(dir_p)?.flatten() {
+                        let path = entry.path();
+                        if path.is_file() && path.extension().map_or(false, |ext| ext.to_string_lossy().eq_ignore_ascii_case("docx")) {
+                            append_list.push(path);
+                        }
+                    }
+                    append_list.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+                }
+            } else if let Some(fs) = files {
+                for f in fs {
+                    append_list.push(sanitize_existing_path(&f)?);
+                }
+            } else if let Some(a) = append {
+                append_list.push(sanitize_existing_path(&a)?);
+            }
+
+            let mut pkg = DocxPackage::from_file(&base_p)?;
+            let resp = merge_multiple_documents(&mut pkg, &base_p.to_string_lossy(), &append_list)?;
             print_json(&resp);
         }
         Commands::ReadTable { file, index, format } => {
-            let pkg = DocxPackage::from_file(&file)?;
+            let p = sanitize_existing_path(&file)?;
+            let pkg = DocxPackage::from_file(&p)?;
             let resp = read_table_data(&pkg, index, &format)?;
             print_json(&resp);
         }
-        Commands::SetCell {
-            file,
-            index,
-            row,
-            col,
-            val,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = set_cell_value(&mut pkg, &file, index, row, col, &val)?;
+        Commands::SetCell { file, index, row, col, val } => {
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = set_cell_value(&mut pkg, &p.to_string_lossy(), index, row, col, &val)?;
             print_json(&resp);
         }
-        Commands::InsertRow {
-            file,
-            index,
-            row,
-            cells,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
+        Commands::InsertRow { file, index, row, cells } => {
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
             let cell_list: Vec<String> = cells.split(',').map(|s| s.trim().to_string()).collect();
-            let resp = insert_table_row(&mut pkg, &file, index, row, &cell_list)?;
+            let resp = insert_table_row(&mut pkg, &p.to_string_lossy(), index, row, &cell_list)?;
             print_json(&resp);
         }
         Commands::DeleteRow { file, index, row } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = delete_table_row(&mut pkg, &file, index, row)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = delete_table_row(&mut pkg, &p.to_string_lossy(), index, row)?;
             print_json(&resp);
         }
         Commands::ExtractImages { file, out_dir } => {
-            let pkg = DocxPackage::from_file(&file)?;
-            let resp = extract_all_images(&pkg, &out_dir)?;
+            let p = sanitize_existing_path(&file)?;
+            let out_p = ensure_output_parent_dir(&format!("{}/placeholder.tmp", clean_path(&out_dir)))?;
+            let real_dir = out_p.parent().unwrap_or(&out_p);
+            let pkg = DocxPackage::from_file(&p)?;
+            let resp = extract_all_images(&pkg, &real_dir.to_string_lossy())?;
             print_json(&resp);
         }
-        Commands::ReplaceImage {
-            file,
-            rid,
-            filename,
-            image,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
+        Commands::ReplaceImage { file, rid, filename, image } => {
+            let p = sanitize_existing_path(&file)?;
+            let img_p = sanitize_existing_path(&image)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
             let resp = replace_image_binary(
                 &mut pkg,
-                &file,
+                &p.to_string_lossy(),
                 rid.as_deref(),
                 filename.as_deref(),
-                &image,
+                &img_p.to_string_lossy(),
             )?;
             print_json(&resp);
         }
-        Commands::InsertImage {
-            file,
-            index,
-            image,
-            width,
-            height,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = insert_image_at_para(&mut pkg, &file, index, &image, width, height)?;
+        Commands::InsertImage { file, index, image, width, height } => {
+            let p = sanitize_existing_path(&file)?;
+            let img_p = sanitize_existing_path(&image)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = insert_image_at_para(&mut pkg, &p.to_string_lossy(), index, &img_p.to_string_lossy(), width, height)?;
             print_json(&resp);
         }
         Commands::Page { file, orient, size } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = setup_page_layout(&mut pkg, &file, &orient, &size)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = setup_page_layout(&mut pkg, &p.to_string_lossy(), &orient, &size)?;
             print_json(&resp);
         }
         Commands::InsertPageBreak { file, index } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = insert_page_break_before(&mut pkg, &file, index.as_deref())?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = insert_page_break_before(&mut pkg, &p.to_string_lossy(), index.as_deref())?;
             print_json(&resp);
         }
         Commands::InsertSection { file } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = insert_section_break(&mut pkg, &file)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = insert_section_break(&mut pkg, &p.to_string_lossy())?;
             print_json(&resp);
         }
         Commands::SetHeader { file, text, unlink } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = set_header_or_footer(&mut pkg, &file, true, text.as_deref(), false, None, unlink)?;
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = set_header_or_footer(&mut pkg, &p.to_string_lossy(), true, text.as_deref(), false, None, unlink)?;
             print_json(&resp);
         }
-        Commands::SetFooter {
-            file,
-            text,
-            page_num,
-            restart,
-            unlink,
-        } => {
-            let mut pkg = DocxPackage::from_file(&file)?;
-            let resp = set_header_or_footer(&mut pkg, &file, false, text.as_deref(), page_num, restart, unlink)?;
+        Commands::SetFooter { file, text, page_num, restart, unlink } => {
+            let p = sanitize_existing_path(&file)?;
+            let mut pkg = DocxPackage::from_file(&p)?;
+            let resp = set_header_or_footer(&mut pkg, &p.to_string_lossy(), false, text.as_deref(), page_num, restart, unlink)?;
             print_json(&resp);
         }
     }
@@ -564,7 +576,10 @@ fn run() -> Result<(), WordCliError> {
 }
 
 fn main() -> ExitCode {
-    if let Err(err) = run() {
+    init_windows_utf8_console();
+    let cli = Cli::parse();
+
+    if let Err(err) = run_app(cli) {
         eprintln!("{}", err.to_json());
         ExitCode::FAILURE
     } else {
