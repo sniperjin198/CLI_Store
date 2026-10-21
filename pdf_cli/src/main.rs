@@ -109,6 +109,15 @@ enum Commands {
         out: String,
     },
 
+    /// 图片打包为 PDF（支持单图/多图 --files / 目录 --dir / 清单 --list）
+    #[command(name = "images-to-pdf", visible_alias = "img2pdf")]
+    ImagesToPdf {
+        #[command(flatten)]
+        input: CommonInputArgs,
+        #[arg(short, long, visible_alias = "out")]
+        output: String,
+    },
+
     /// 物理合并（支持 --dir / --list / --files）
     Merge {
         #[command(flatten)]
@@ -223,6 +232,11 @@ fn run_app(cli: Cli) -> Result<String, PdfCliError> {
         } => {
             let files = input.resolve_inputs(None)?;
             media::render_page(&files[0].to_string_lossy(), page, dpi, &out)
+                .and_then(|res| to_json_output(&res))
+        }
+        Commands::ImagesToPdf { input, output } => {
+            let files = input.resolve_image_inputs()?;
+            transform::images_to_pdf(&files, &output)
                 .and_then(|res| to_json_output(&res))
         }
         Commands::Merge { input, output } => {

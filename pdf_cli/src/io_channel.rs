@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use crate::error::PdfCliError;
 
+const SUPPORTED_IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "bmp", "tiff", "tif"];
+
 #[derive(Args, Debug, Clone)]
 pub struct CommonInputArgs {
     /// 目标单一 PDF 文件
@@ -24,7 +26,7 @@ pub struct CommonInputArgs {
 }
 
 impl CommonInputArgs {
-    /// 解析出所有干净、合法的输入文件绝对路径列表
+    /// 解析出所有干净、合法的输入 PDF 文件绝对路径列表
     pub fn resolve_inputs(&self, exclude_output: Option<&str>) -> Result<Vec<PathBuf>, PdfCliError> {
         let mut candidates = Vec::new();
 
@@ -97,6 +99,75 @@ impl CommonInputArgs {
 
         if valid_files.is_empty() {
             return Err(PdfCliError::invalid_parameter("未定位到任何有效的输入 PDF 文件"));
+        }
+
+        Ok(valid_files)
+    }
+
+    /// 解析出所有图片文件（单文件、逗号隔开的多文件、目录扫描、txt 清单）
+    pub fn resolve_image_inputs(&self) -> Result<Vec<PathBuf>, PdfCliError> {
+        let mut candidates = Vec::new();
+
+        // 1. 单文件模式
+        if let Some(ref f) = self.file {
+            candidates.push(clean_path_buf(f));
+        }
+
+        // 2. 离散列表模式 (--files a.jpg,b.png)
+        if let Some(ref list) = self.files {
+            for item in list {
+                candidates.push(clean_path_buf(item));
+            }
+        }
+
+        // 3. 目录扫描模式 (--dir ./photos)
+        if let Some(ref d) = self.dir {
+            let dir_buf = clean_path_buf(d);
+            if !dir_buf.exists() || !dir_buf.is_dir() {
+                return Err(PdfCliError::not_found(format!("指定的图片目录不存在: {}", dir_buf.display())));
+            }
+            let entries = fs::read_dir(&dir_buf).map_err(|e| {
+                PdfCliError::io(format!("读取目录 '{}' 失败: {}", dir_buf.display(), e))
+            })?;
+
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() {
+                    if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
+                        if SUPPORTED_IMAGE_EXTS.iter().any(|&e| ext.eq_ignore_ascii_case(e)) {
+                            candidates.push(p);
+                        }
+                    }
+                }
+            }
+            // 自然顺序排序，确保打包成 PDF 时的页码顺序与文件名正序一致
+            candidates.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+        }
+
+        // 4. 清单文本文件模式 (--list img_list.txt)
+        if let Some(ref l) = self.list {
+            let list_path = clean_path_buf(l);
+            if !list_path.exists() {
+                return Err(PdfCliError::not_found(format!("指定的清单文件不存在: {}", list_path.display())));
+            }
+            let file = fs::File::open(&list_path).map_err(|e| PdfCliError::io(e.to_string()))?;
+            for line in io::BufReader::new(file).lines().flatten() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                    candidates.push(clean_path_buf(trimmed));
+                }
+            }
+        }
+
+        let mut valid_files = Vec::new();
+        for p in candidates {
+            if p.exists() && p.is_file() {
+                valid_files.push(p);
+            }
+        }
+
+        if valid_files.is_empty() {
+            return Err(PdfCliError::invalid_parameter("未定位到任何有效的图片输入文件"));
         }
 
         Ok(valid_files)
