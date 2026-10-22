@@ -1,5 +1,6 @@
 /excel_cli/target/
 /word_cli/target/
 /pdf_cli/target/
+/webscrape/target/
 .goosehints
 target/
